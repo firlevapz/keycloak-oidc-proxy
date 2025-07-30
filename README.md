@@ -65,7 +65,27 @@ docker-compose up --build
 docker-compose down
 ```
 
+You can also use the pre-built image by updating your `docker-compose.yml`:
+```yaml
+services:
+  oidc-proxy:
+    image: ghcr.io/firlevapz/keycloak-oidc-proxy:latest
+    # ... rest of configuration
+```
+
 ### Docker
+
+#### Using Pre-built Image (Recommended)
+
+Use the latest image from GitHub Container Registry:
+```bash
+docker run -p 8080:8080 \
+  -e OIDC_CONFIGURATION_URL="https://auth.hoad.at/application/o/audiobookshelf/.well-known/openid-configuration" \
+  -e LOG_LEVEL="info" \
+  ghcr.io/firlevapz/keycloak-oidc-proxy:latest
+```
+
+#### Building Locally
 
 Build the image:
 ```bash
@@ -129,3 +149,41 @@ The final Docker image is extremely small (~6MB) thanks to:
 - Scratch base image
 - Static binary compilation
 - Only essential certificates included
+
+## CI/CD
+
+The project includes GitHub Actions workflows for:
+
+### Continuous Integration (CI)
+- **Workflow**: `.github/workflows/ci.yml`
+- **Triggers**: Push/PR to main branch
+- **Actions**:
+  - Go code formatting check (`go fmt`)
+  - Static analysis (`go vet`)
+  - Unit tests with race detection
+  - Code coverage reporting
+  - Build verification
+
+### Docker Image Building
+- **Workflow**: `.github/workflows/docker-build.yml`
+- **Triggers**: 
+  - Push to main branch (builds `latest` tag)
+  - Pull requests (builds PR-specific tags)
+  - Releases (builds version tags)
+- **Features**:
+  - Multi-architecture builds (AMD64, ARM64)
+  - Automatic tagging based on Git refs
+  - GitHub Container Registry publishing
+  - Build caching for faster builds
+  - SLSA attestation for supply chain security
+
+### Available Images
+
+| Tag | Description | Example |
+|-----|-------------|---------|
+| `latest` | Latest build from main branch | `ghcr.io/firlevapz/keycloak-oidc-proxy:latest` |
+| `main` | Latest build from main branch | `ghcr.io/firlevapz/keycloak-oidc-proxy:main` |
+| `pr-N` | Pull request builds | `ghcr.io/firlevapz/keycloak-oidc-proxy:pr-123` |
+| `v1.0.0` | Release tags | `ghcr.io/firlevapz/keycloak-oidc-proxy:v1.0.0` |
+
+Images are automatically built for both `linux/amd64` and `linux/arm64` architectures.
