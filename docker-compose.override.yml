@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  oidc-proxy:
+    environment:
+      # Override log level for development
+      LOG_LEVEL: "debug"
+    # Add volume mount for live development (optional)
+    # volumes:
+    #   - .:/app
+    # Override command for development (optional)
+    # command: ["go", "run", "main.go"]
