@@ -1,11 +1,11 @@
-# Keycloak OIDC Proxy
+# Keycloak OIDC Redirect Service
 
-A lightweight Go-based proxy server that translates Keycloak-style OIDC endpoints to any OIDC provider by fetching configuration from a well-known OpenID Connect configuration endpoint.
+A lightweight Go-based redirect service that translates Keycloak-style OIDC endpoints to any OIDC provider by fetching configuration from a well-known OpenID Connect configuration endpoint and redirecting clients with preserved query parameters.
 
 ## Features
 
 - Fetches OIDC configuration from any `.well-known/openid-configuration` endpoint
-- Proxies Keycloak-style URLs to the actual OIDC provider endpoints:
+- Redirects Keycloak-style URLs to the actual OIDC provider endpoints (preserving all query parameters):
   - `/protocol/openid-connect/auth` → `authorization_endpoint`
   - `/protocol/openid-connect/token` → `token_endpoint`
 - Configurable logging levels (trace, debug, info, warn, error, fatal, panic)
@@ -102,8 +102,8 @@ docker run -p 8080:8080 \
 
 ## Endpoints
 
-- `GET /protocol/openid-connect/auth` - Proxies to the authorization endpoint
-- `POST /protocol/openid-connect/token` - Proxies to the token endpoint  
+- `GET /protocol/openid-connect/auth` - Redirects to the authorization endpoint (HTTP 302)
+- `POST /protocol/openid-connect/token` - Redirects to the token endpoint (HTTP 302)
 - `GET /health` - Health check endpoint
 
 ## Example
@@ -117,30 +117,32 @@ If your OIDC provider configuration is:
 ```
 
 Then:
-- `http://localhost:8080/protocol/openid-connect/auth` will proxy to `https://auth.hoad.at/application/o/authorize/`
-- `http://localhost:8080/protocol/openid-connect/token` will proxy to `https://auth.hoad.at/application/o/token/`
+- `http://localhost:8080/protocol/openid-connect/auth?client_id=test&response_type=code` will redirect to `https://auth.hoad.at/application/o/authorize/?client_id=test&response_type=code`
+- `http://localhost:8080/protocol/openid-connect/token` will redirect to `https://auth.hoad.at/application/o/token/`
+
+All query parameters are preserved during the redirect.
 
 ## Logging
 
 The application supports various log levels:
 
 - **trace**: Extremely verbose logging
-- **debug**: Detailed request/response information including headers and body
-- **info**: General operational information (default)
+- **debug**: Detailed request/response information including headers, body, and redirect URLs
+- **info**: General operational information including redirect actions (default)
 - **warn**: Warning messages
 - **error**: Error messages
 - **fatal**: Fatal errors that cause the application to exit
 - **panic**: Panic level logging
 
-Set `LOG_LEVEL=debug` to see detailed request forwarding information.
+Set `LOG_LEVEL=debug` to see detailed request and redirect information.
 
 ## Security Features
 
-- Request timeouts to prevent hanging connections
+- Request timeouts to prevent hanging connections during OIDC configuration fetching
 - Graceful shutdown handling
-- Proper X-Forwarded headers
 - Minimal attack surface with scratch-based Docker image
 - No unnecessary dependencies in production image
+- URL validation for redirect endpoints
 
 ## Docker Image Size
 

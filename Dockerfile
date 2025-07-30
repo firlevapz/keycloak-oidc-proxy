@@ -19,7 +19,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags='-w -s -extldflags "-static"' \
     -a -installsuffix cgo \
-    -o oidc-proxy .
+    -o oidc-redirect .
 
 # Final stage
 FROM scratch
@@ -28,7 +28,7 @@ FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
 # Copy the binary
-COPY --from=builder /app/oidc-proxy /oidc-proxy
+COPY --from=builder /app/oidc-redirect /oidc-redirect
 
 # Expose port 8080
 EXPOSE 8080
@@ -38,4 +38,4 @@ ENV LOG_LEVEL=info
 ENV PORT=8080
 
 # Run the binary
-ENTRYPOINT ["/oidc-proxy"]
+ENTRYPOINT ["/oidc-redirect"]

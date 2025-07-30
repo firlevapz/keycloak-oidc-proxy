@@ -1,7 +1,7 @@
 .PHONY: build run test clean docker-build docker-run compose-up compose-down compose-logs
 
 # Variables
-BINARY_NAME=oidc-proxy
+BINARY_NAME=oidc-redirect
 DOCKER_IMAGE=keycloak-oidc-proxy
 
 # Build the application
