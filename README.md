@@ -9,6 +9,7 @@ A lightweight Go-based service that provides Keycloak-compatible OIDC endpoints 
   - `/protocol/openid-connect/auth` → **Redirects** to `authorization_endpoint` (preserving all query parameters)
   - `/protocol/openid-connect/token` → **Proxies** to `token_endpoint` (transparent backend handling)
   - `/protocol/openid-connect/userinfo` → **Proxies** to `userinfo_endpoint` (transparent backend handling)
+- **Automatic OIDC scope injection**: Ensures `oidc` scope is always included in authorization requests for proper OpenID Connect flow
 - Configurable logging levels (trace, debug, info, warn, error, fatal, panic)
 - Health check endpoint
 - Graceful shutdown
@@ -121,22 +122,38 @@ The service provides comprehensive debug logging when `LOG_LEVEL=debug` is set. 
 - `GET /protocol/openid-connect/userinfo` - **Proxies** to the userinfo endpoint (transparent handling)
 - `GET /health` - Health check endpoint
 
+## OIDC Scope Injection
+
+The service automatically ensures that the `oidc` scope is included in authorization requests to guarantee proper OpenID Connect authentication flow:
+
+- **No existing scope**: Adds `scope=oidc`
+- **Existing scopes without oidc**: Appends `oidc` to existing scopes (e.g., `scope=openid profile` becomes `scope=openid profile oidc`)
+- **OIDC scope already present**: Leaves scopes unchanged
+- **Multiple scope parameters**: Consolidates all scopes and ensures `oidc` is included
+
+This ensures that ID tokens are properly issued by the OIDC provider, even when client applications forget to request the `oidc` scope.
+
 ## Example
 
 If your OIDC provider configuration is:
 ```json
 {
   "authorization_endpoint": "https://auth.hoad.at/application/o/authorize/",
-  "token_endpoint": "https://auth.hoad.at/application/o/token/"
+  "token_endpoint": "https://auth.hoad.at/application/o/token/",
+  "userinfo_endpoint": "https://auth.hoad.at/application/o/userinfo/"
 }
 ```
 
-### Authorization Endpoint (Redirect)
-- `http://localhost:8080/protocol/openid-connect/auth?client_id=test&response_type=code` will redirect (HTTP 302) to `https://auth.hoad.at/application/o/authorize/?client_id=test&response_type=code`
+### Authorization Endpoint (Redirect with OIDC scope)
+- `http://localhost:8080/protocol/openid-connect/auth?client_id=test&response_type=code` will redirect (HTTP 302) to `https://auth.hoad.at/application/o/authorize/?client_id=test&response_type=code&scope=oidc`
+- `http://localhost:8080/protocol/openid-connect/auth?client_id=test&scope=openid+profile` will redirect to `https://auth.hoad.at/application/o/authorize/?client_id=test&scope=openid+profile+oidc`
 - All query parameters are preserved during the redirect
 
 ### Token Endpoint (Proxy)
 - `POST http://localhost:8080/protocol/openid-connect/token` will proxy the request to `https://auth.hoad.at/application/o/token/`
+
+### Userinfo Endpoint (Proxy)
+- `GET http://localhost:8080/protocol/openid-connect/userinfo` will proxy the request to `https://auth.hoad.at/application/o/userinfo/`
 - Request body, headers, and response are transparently handled
 - Client receives the response as if calling the token endpoint directly
 

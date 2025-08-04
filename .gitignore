@@ -1,5 +1,6 @@
 # Binaries
 oidc-proxy
+keycloak-oidc-proxy
 oidc-redirect
 *.exe
 *.exe~

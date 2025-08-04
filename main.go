@@ -608,22 +608,71 @@ func (ps *ProxyServer) buildRedirectURL(targetEndpoint string, originalQuery url
 		return "", fmt.Errorf("failed to parse target endpoint: %w", err)
 	}
 
-	// Merge original query parameters with any existing parameters in the target URL
-	if len(originalQuery) > 0 {
-		// Parse existing query parameters from target URL
-		existingQuery := targetURL.Query()
+	// Parse existing query parameters from target URL
+	existingQuery := targetURL.Query()
 
-		// Add original query parameters (original takes precedence if there are conflicts)
-		for key, values := range originalQuery {
-			for _, value := range values {
-				existingQuery.Add(key, value)
-			}
+	// Add original query parameters (original takes precedence if there are conflicts)
+	for key, values := range originalQuery {
+		for _, value := range values {
+			existingQuery.Add(key, value)
 		}
-
-		targetURL.RawQuery = existingQuery.Encode()
 	}
 
+	// Ensure "oidc" scope is present for proper OpenID Connect authentication
+	ps.ensureOidcScope(&existingQuery)
+
+	targetURL.RawQuery = existingQuery.Encode()
 	return targetURL.String(), nil
+}
+
+// ensureOidcScope ensures that the "oidc" scope is included in the scope parameter
+func (ps *ProxyServer) ensureOidcScope(query *url.Values) {
+	scopeValues := (*query)["scope"]
+	
+	// Check if we have any scope parameters
+	if len(scopeValues) == 0 {
+		// No scope parameter exists, add "oidc" scope
+		query.Set("scope", "oidc")
+		ps.logger.WithField("action", "added_oidc_scope").Debug("Added 'oidc' scope to auth request (no existing scope)")
+		return
+	}
+
+	// Check all scope values to see if "oidc" is already present
+	var allScopes []string
+	oidcPresent := false
+	
+	for _, scopeValue := range scopeValues {
+		// Split scope value by spaces (standard OAuth2 scope separator)
+		scopes := strings.Fields(scopeValue)
+		for _, scope := range scopes {
+			scope = strings.TrimSpace(scope)
+			if scope == "oidc" {
+				oidcPresent = true
+			}
+			if scope != "" {
+				allScopes = append(allScopes, scope)
+			}
+		}
+	}
+
+	if !oidcPresent {
+		// Add "oidc" to the list of scopes
+		allScopes = append(allScopes, "oidc")
+		
+		// Replace all scope parameters with a single consolidated scope parameter
+		query.Del("scope")
+		query.Set("scope", strings.Join(allScopes, " "))
+		
+		ps.logger.WithFields(logrus.Fields{
+			"action": "added_oidc_scope",
+			"final_scopes": strings.Join(allScopes, " "),
+		}).Debug("Added 'oidc' scope to existing scopes in auth request")
+	} else {
+		ps.logger.WithFields(logrus.Fields{
+			"action": "oidc_scope_already_present",
+			"existing_scopes": strings.Join(allScopes, " "),
+		}).Debug("OIDC scope already present in auth request")
+	}
 }
 
 // handleAuth handles requests to /protocol/openid-connect/auth by redirecting to authorization endpoint
