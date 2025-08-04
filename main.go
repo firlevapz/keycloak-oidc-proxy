@@ -618,36 +618,36 @@ func (ps *ProxyServer) buildRedirectURL(targetEndpoint string, originalQuery url
 		}
 	}
 
-	// Ensure "oidc" scope is present for proper OpenID Connect authentication
-	ps.ensureOidcScope(&existingQuery)
+	// Ensure "openid" scope is present for proper OpenID Connect authentication
+	ps.ensureOpenidScope(&existingQuery)
 
 	targetURL.RawQuery = existingQuery.Encode()
 	return targetURL.String(), nil
 }
 
-// ensureOidcScope ensures that the "oidc" scope is included in the scope parameter
-func (ps *ProxyServer) ensureOidcScope(query *url.Values) {
+// ensureopenidScope ensures that the "openid" scope is included in the scope parameter
+func (ps *ProxyServer) ensureOpenidScope(query *url.Values) {
 	scopeValues := (*query)["scope"]
 	
 	// Check if we have any scope parameters
 	if len(scopeValues) == 0 {
-		// No scope parameter exists, add "oidc" scope
-		query.Set("scope", "oidc")
-		ps.logger.WithField("action", "added_oidc_scope").Debug("Added 'oidc' scope to auth request (no existing scope)")
+		// No scope parameter exists, add "openid" scope
+		query.Set("scope", "openid")
+		ps.logger.WithField("action", "added_openid_scope").Debug("Added 'openid' scope to auth request (no existing scope)")
 		return
 	}
 
-	// Check all scope values to see if "oidc" is already present
+	// Check all scope values to see if "openid" is already present
 	var allScopes []string
-	oidcPresent := false
+	openidPresent := false
 	
 	for _, scopeValue := range scopeValues {
 		// Split scope value by spaces (standard OAuth2 scope separator)
 		scopes := strings.Fields(scopeValue)
 		for _, scope := range scopes {
 			scope = strings.TrimSpace(scope)
-			if scope == "oidc" {
-				oidcPresent = true
+			if scope == "openid" {
+				openidPresent = true
 			}
 			if scope != "" {
 				allScopes = append(allScopes, scope)
@@ -655,23 +655,23 @@ func (ps *ProxyServer) ensureOidcScope(query *url.Values) {
 		}
 	}
 
-	if !oidcPresent {
-		// Add "oidc" to the list of scopes
-		allScopes = append(allScopes, "oidc")
+	if !openidPresent {
+		// Add "openid" to the list of scopes
+		allScopes = append(allScopes, "openid")
 		
 		// Replace all scope parameters with a single consolidated scope parameter
 		query.Del("scope")
 		query.Set("scope", strings.Join(allScopes, " "))
 		
 		ps.logger.WithFields(logrus.Fields{
-			"action": "added_oidc_scope",
+			"action": "added_openid_scope",
 			"final_scopes": strings.Join(allScopes, " "),
-		}).Debug("Added 'oidc' scope to existing scopes in auth request")
+		}).Debug("Added 'openid' scope to existing scopes in auth request")
 	} else {
 		ps.logger.WithFields(logrus.Fields{
-			"action": "oidc_scope_already_present",
+			"action": "openid_scope_already_present",
 			"existing_scopes": strings.Join(allScopes, " "),
-		}).Debug("OIDC scope already present in auth request")
+		}).Debug("openid scope already present in auth request")
 	}
 }
 
