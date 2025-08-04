@@ -17,6 +17,31 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// responseWriter wraps http.ResponseWriter to capture response details
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	body       *strings.Builder
+}
+
+func (rw *responseWriter) WriteHeader(statusCode int) {
+	rw.statusCode = statusCode
+	rw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	rw.body.Write(b)
+	return rw.ResponseWriter.Write(b)
+}
+
 // OIDCConfiguration represents the OpenID Connect configuration
 type OIDCConfiguration struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
@@ -100,20 +125,34 @@ func (ps *ProxyServer) createTokenProxy() error {
 	ps.tokenProxy = httputil.NewSingleHostReverseProxy(tokenURL)
 	ps.tokenProxy.Director = ps.createTokenDirector(tokenURL)
 	
+	// Add response modifier for detailed logging
+	if ps.logger.Level >= logrus.DebugLevel {
+		ps.tokenProxy.ModifyResponse = ps.modifyTokenResponse
+	}
+	
 	return nil
 }
 
 // createTokenDirector creates a custom director function for the token proxy
 func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) {
 	return func(req *http.Request) {
+		originalScheme := req.URL.Scheme
+		originalHost := req.URL.Host
+		originalPath := req.URL.Path
+		
 		ps.logger.WithFields(logrus.Fields{
 			"endpoint_type":  "token",
-			"original_path":  req.URL.Path,
+			"original_path":  originalPath,
+			"original_host":  originalHost,
+			"original_scheme": originalScheme,
 			"target_host":    target.Host,
 			"target_scheme":  target.Scheme,
+			"target_path":    target.Path,
 			"method":         req.Method,
 			"remote_addr":    req.RemoteAddr,
 			"user_agent":     req.UserAgent(),
+			"content_length": req.ContentLength,
+			"transfer_encoding": req.TransferEncoding,
 		}).Info("Proxying token request")
 
 		if ps.logger.Level >= logrus.DebugLevel {
@@ -127,12 +166,122 @@ func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) 
 
 		// Add X-Forwarded headers
 		if req.Header.Get("X-Forwarded-Proto") == "" {
-			req.Header.Set("X-Forwarded-Proto", "http")
+			req.Header.Set("X-Forwarded-Proto", originalScheme)
 		}
 		if req.Header.Get("X-Forwarded-For") == "" {
 			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
 		}
+		if req.Header.Get("X-Forwarded-Host") == "" {
+			req.Header.Set("X-Forwarded-Host", originalHost)
+		}
+
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type": "token",
+			"final_url":     req.URL.String(),
+			"final_host":    req.Host,
+		}).Debug("Token request URL transformation complete")
 	}
+}
+
+// modifyTokenResponse logs detailed response information for token endpoint
+func (ps *ProxyServer) modifyTokenResponse(resp *http.Response) error {
+	if resp == nil {
+		ps.logger.Error("Received nil response from token endpoint")
+		return nil
+	}
+
+	// Read the response body for logging
+	var responseBody []byte
+	if resp.Body != nil {
+		var err error
+		responseBody, err = io.ReadAll(resp.Body)
+		if err != nil {
+			ps.logger.WithError(err).Error("Failed to read token response body for logging")
+		} else {
+			// Restore the response body
+			resp.Body = io.NopCloser(strings.NewReader(string(responseBody)))
+		}
+	}
+
+	// Collect response headers
+	responseHeaders := make(map[string]string)
+	for key, values := range resp.Header {
+		responseHeaders[key] = strings.Join(values, ", ")
+	}
+
+	ps.logger.WithFields(logrus.Fields{
+		"endpoint_type":      "token",
+		"response_status":    resp.Status,
+		"response_status_code": resp.StatusCode,
+		"response_headers":   responseHeaders,
+		"response_body":      string(responseBody),
+		"response_length":    len(responseBody),
+		"content_type":       resp.Header.Get("Content-Type"),
+		"cache_control":      resp.Header.Get("Cache-Control"),
+		"expires":           resp.Header.Get("Expires"),
+	}).Debug("Token endpoint response details")
+
+	// Log specific token response analysis
+	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") && len(responseBody) > 0 {
+		ps.analyzeTokenResponse(responseBody)
+	}
+
+	return nil
+}
+
+// analyzeTokenResponse analyzes and logs token response content
+func (ps *ProxyServer) analyzeTokenResponse(responseBody []byte) {
+	var tokenData map[string]interface{}
+	if err := json.Unmarshal(responseBody, &tokenData); err != nil {
+		ps.logger.WithError(err).Debug("Failed to parse token response as JSON")
+		return
+	}
+
+	// Log token response analysis
+	analysis := logrus.Fields{
+		"endpoint_type": "token",
+	}
+
+	// Check for standard OAuth2/OIDC fields
+	if accessToken, ok := tokenData["access_token"].(string); ok {
+		analysis["has_access_token"] = true
+		analysis["access_token_length"] = len(accessToken)
+		analysis["access_token_preview"] = accessToken[:min(20, len(accessToken))] + "..."
+	}
+
+	if refreshToken, ok := tokenData["refresh_token"].(string); ok {
+		analysis["has_refresh_token"] = true
+		analysis["refresh_token_length"] = len(refreshToken)
+	}
+
+	if idToken, ok := tokenData["id_token"].(string); ok {
+		analysis["has_id_token"] = true
+		analysis["id_token_length"] = len(idToken)
+		analysis["id_token_preview"] = idToken[:min(50, len(idToken))] + "..."
+	}
+
+	if tokenType, ok := tokenData["token_type"].(string); ok {
+		analysis["token_type"] = tokenType
+	}
+
+	if expiresIn, ok := tokenData["expires_in"].(float64); ok {
+		analysis["expires_in_seconds"] = int(expiresIn)
+	}
+
+	if scope, ok := tokenData["scope"].(string); ok {
+		analysis["scope"] = scope
+	}
+
+	// Check for error fields
+	if errorCode, ok := tokenData["error"].(string); ok {
+		analysis["error_code"] = errorCode
+	}
+
+	if errorDesc, ok := tokenData["error_description"].(string); ok {
+		analysis["error_description"] = errorDesc
+	}
+
+	ps.logger.WithFields(analysis).Debug("Token response analysis")
 }
 
 // buildRedirectURL constructs the redirect URL by preserving all query parameters
@@ -192,6 +341,8 @@ func (ps *ProxyServer) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 // handleToken handles requests to /protocol/openid-connect/token by proxying to token endpoint
 func (ps *ProxyServer) handleToken(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
 	ps.logger.WithFields(logrus.Fields{
 		"endpoint_type": "token",
 		"original_path": r.URL.Path,
@@ -199,9 +350,36 @@ func (ps *ProxyServer) handleToken(w http.ResponseWriter, r *http.Request) {
 		"remote_addr":   r.RemoteAddr,
 		"user_agent":    r.UserAgent(),
 		"query_params":  r.URL.RawQuery,
+		"start_time":    startTime.Format(time.RFC3339Nano),
 	}).Info("Proxying to token endpoint")
 
-	ps.tokenProxy.ServeHTTP(w, r)
+	// Create a response writer wrapper to capture response details
+	if ps.logger.Level >= logrus.DebugLevel {
+		wrappedWriter := &responseWriter{
+			ResponseWriter: w,
+			statusCode:     200, // default
+			body:          &strings.Builder{},
+		}
+		
+		ps.tokenProxy.ServeHTTP(wrappedWriter, r)
+		
+		duration := time.Since(startTime)
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type":     "token",
+			"duration_ms":       duration.Milliseconds(),
+			"duration_ns":       duration.Nanoseconds(),
+			"response_status":   wrappedWriter.statusCode,
+			"response_size":     wrappedWriter.body.Len(),
+			"end_time":          time.Now().Format(time.RFC3339Nano),
+		}).Debug("Token proxy request completed")
+	} else {
+		ps.tokenProxy.ServeHTTP(w, r)
+		duration := time.Since(startTime)
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type": "token",
+			"duration_ms":   duration.Milliseconds(),
+		}).Info("Token proxy request completed")
+	}
 }
 
 // logRequestDetails logs detailed request information at debug level for redirects
@@ -233,17 +411,122 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 		req.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 	}
 
+	// Collect all headers
 	headers := make(map[string]string)
 	for key, values := range req.Header {
 		headers[key] = strings.Join(values, ", ")
 	}
 
+	// Parse form data if present
+	var formData map[string][]string
+	var parsedBody interface{}
+	contentType := req.Header.Get("Content-Type")
+	
+	if strings.Contains(contentType, "application/x-www-form-urlencoded") && len(bodyBytes) > 0 {
+		if values, err := url.ParseQuery(string(bodyBytes)); err == nil {
+			formData = values
+			
+			// Create a sanitized version for logging (hide sensitive data)
+			sanitizedForm := make(map[string]string)
+			for key, vals := range values {
+				if ps.isSensitiveField(key) {
+					sanitizedForm[key] = "[REDACTED]"
+				} else {
+					sanitizedForm[key] = strings.Join(vals, ", ")
+				}
+			}
+			parsedBody = sanitizedForm
+		}
+	} else if strings.Contains(contentType, "application/json") && len(bodyBytes) > 0 {
+		var jsonData map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &jsonData); err == nil {
+			// Sanitize sensitive fields in JSON
+			sanitizedJson := make(map[string]interface{})
+			for key, value := range jsonData {
+				if ps.isSensitiveField(key) {
+					sanitizedJson[key] = "[REDACTED]"
+				} else {
+					sanitizedJson[key] = value
+				}
+			}
+			parsedBody = sanitizedJson
+		}
+	}
+
+	// Log comprehensive request details
 	ps.logger.WithFields(logrus.Fields{
-		"endpoint_type": endpointType,
-		"headers":       headers,
-		"body":          string(bodyBytes),
-		"query":         req.URL.RawQuery,
-	}).Debug("Proxy request details")
+		"endpoint_type":     endpointType,
+		"method":           req.Method,
+		"url":              req.URL.String(),
+		"raw_query":        req.URL.RawQuery,
+		"headers":          headers,
+		"content_type":     contentType,
+		"content_length":   req.ContentLength,
+		"transfer_encoding": req.TransferEncoding,
+		"host":             req.Host,
+		"remote_addr":      req.RemoteAddr,
+		"request_uri":      req.RequestURI,
+		"proto":            req.Proto,
+		"proto_major":      req.ProtoMajor,
+		"proto_minor":      req.ProtoMinor,
+		"body_raw":         string(bodyBytes),
+		"body_length":      len(bodyBytes),
+		"parsed_body":      parsedBody,
+		"form_data_fields": len(formData),
+		"has_auth_header":  req.Header.Get("Authorization") != "",
+		"user_agent":       req.UserAgent(),
+		"referer":          req.Header.Get("Referer"),
+		"origin":           req.Header.Get("Origin"),
+	}).Debug("Detailed proxy request information")
+
+	// Log query parameters separately if they exist
+	if len(req.URL.Query()) > 0 {
+		queryParams := make(map[string]string)
+		for key, values := range req.URL.Query() {
+			if ps.isSensitiveField(key) {
+				queryParams[key] = "[REDACTED]"
+			} else {
+				queryParams[key] = strings.Join(values, ", ")
+			}
+		}
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type":   endpointType,
+			"query_parameters": queryParams,
+		}).Debug("Query parameters details")
+	}
+
+	// Log cookies if present
+	if len(req.Cookies()) > 0 {
+		cookieDetails := make(map[string]string)
+		for _, cookie := range req.Cookies() {
+			if ps.isSensitiveField(cookie.Name) {
+				cookieDetails[cookie.Name] = "[REDACTED]"
+			} else {
+				cookieDetails[cookie.Name] = cookie.Value
+			}
+		}
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type": endpointType,
+			"cookies":      cookieDetails,
+		}).Debug("Request cookies")
+	}
+}
+
+// isSensitiveField checks if a field name contains sensitive information
+func (ps *ProxyServer) isSensitiveField(fieldName string) bool {
+	sensitiveFields := []string{
+		"password", "client_secret", "refresh_token", "access_token",
+		"id_token", "authorization", "auth", "secret", "key", "token",
+		"credential", "pass", "pwd",
+	}
+	
+	fieldLower := strings.ToLower(fieldName)
+	for _, sensitive := range sensitiveFields {
+		if strings.Contains(fieldLower, sensitive) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleHealth provides a health check endpoint

@@ -130,14 +130,44 @@ If your OIDC provider configuration is:
 The application supports various log levels:
 
 - **trace**: Extremely verbose logging
-- **debug**: Detailed request/response information including headers, body, redirect URLs, and proxy details
+- **debug**: **Highly detailed** request/response information including:
+  - Complete request headers, body, and parsed form data
+  - Response headers, body, and status codes
+  - Token response analysis (access_token, refresh_token, id_token details)
+  - Request/response timing and performance metrics
+  - URL transformations and proxy routing details
+  - Sensitive data redaction for security
 - **info**: General operational information including redirect and proxy actions (default)
 - **warn**: Warning messages
 - **error**: Error messages
 - **fatal**: Fatal errors that cause the application to exit
 - **panic**: Panic level logging
 
-Set `LOG_LEVEL=debug` to see detailed request, redirect, and proxy information.
+Set `LOG_LEVEL=debug` to see **extremely detailed** request, redirect, and proxy information with full request/response analysis.
+
+### Debug Logging Features
+
+When `LOG_LEVEL=debug` is enabled for token endpoint proxying, you get:
+
+**Request Analysis:**
+- Complete HTTP headers and metadata
+- Request body parsing (form data, JSON)
+- Query parameter extraction
+- Cookie analysis
+- Protocol version details
+- Timing information (start time, duration)
+
+**Response Analysis:**
+- Full response headers and status codes
+- Response body content
+- Token response parsing (access_token, refresh_token, id_token)
+- Content type and cache header analysis
+- Response size and timing metrics
+
+**Security Features:**
+- Automatic redaction of sensitive fields (passwords, tokens, secrets)
+- Safe logging of token previews (first 20 characters only)
+- Protection of authorization headers and credentials
 
 ## Why Hybrid Approach?
 
