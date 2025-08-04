@@ -10,9 +10,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 )
@@ -23,6 +25,32 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// isValidUTF8 checks if a string is valid UTF-8
+func isValidUTF8(s string) bool {
+	return utf8.ValidString(s)
+}
+
+// extractCharsetFromContentType extracts charset from Content-Type header
+func extractCharsetFromContentType(contentType string) string {
+	if contentType == "" {
+		return "unknown"
+	}
+	
+	// Look for charset parameter in Content-Type header
+	re := regexp.MustCompile(`charset=([^;]+)`)
+	matches := re.FindStringSubmatch(contentType)
+	if len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	
+	// Default charset for JSON is UTF-8
+	if strings.Contains(contentType, "application/json") {
+		return "utf-8"
+	}
+	
+	return "unknown"
 }
 
 // responseWriter wraps http.ResponseWriter to capture response details
@@ -192,14 +220,24 @@ func (ps *ProxyServer) modifyTokenResponse(resp *http.Response) error {
 
 	// Read the response body for logging
 	var responseBody []byte
+	var responseBodyStr string
 	if resp.Body != nil {
 		var err error
 		responseBody, err = io.ReadAll(resp.Body)
 		if err != nil {
 			ps.logger.WithError(err).Error("Failed to read token response body for logging")
 		} else {
-			// Restore the response body
-			resp.Body = io.NopCloser(strings.NewReader(string(responseBody)))
+			// Convert to string handling UTF-8 encoding properly
+			responseBodyStr = string(responseBody)
+			// Restore the response body with a new reader
+			resp.Body = io.NopCloser(strings.NewReader(responseBodyStr))
+			
+			ps.logger.WithFields(logrus.Fields{
+				"endpoint_type": "token",
+				"body_bytes_length": len(responseBody),
+				"body_string_length": len(responseBodyStr),
+				"body_is_utf8": isValidUTF8(responseBodyStr),
+			}).Debug("Response body reading completed")
 		}
 	}
 
@@ -214,26 +252,59 @@ func (ps *ProxyServer) modifyTokenResponse(resp *http.Response) error {
 		"response_status":    resp.Status,
 		"response_status_code": resp.StatusCode,
 		"response_headers":   responseHeaders,
-		"response_body":      string(responseBody),
-		"response_length":    len(responseBody),
+		"response_body":      responseBodyStr,
+		"response_length":    len(responseBodyStr),
+		"response_bytes_length": len(responseBody),
 		"content_type":       resp.Header.Get("Content-Type"),
 		"cache_control":      resp.Header.Get("Cache-Control"),
 		"expires":           resp.Header.Get("Expires"),
+		"content_encoding":   resp.Header.Get("Content-Encoding"),
+		"charset":           extractCharsetFromContentType(resp.Header.Get("Content-Type")),
 	}).Debug("Token endpoint response details")
 
-	// Log specific token response analysis
-	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") && len(responseBody) > 0 {
-		ps.analyzeTokenResponse(responseBody)
+	// Log specific token response analysis for JSON content
+	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") && len(responseBodyStr) > 0 {
+		ps.analyzeTokenResponse(responseBodyStr)
+	} else if len(responseBodyStr) > 0 {
+		// Log non-JSON responses with a preview
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type": "token",
+			"response_preview": responseBodyStr[:min(500, len(responseBodyStr))],
+			"is_json": false,
+		}).Debug("Non-JSON token response preview")
 	}
 
 	return nil
 }
 
 // analyzeTokenResponse analyzes and logs token response content
-func (ps *ProxyServer) analyzeTokenResponse(responseBody []byte) {
+func (ps *ProxyServer) analyzeTokenResponse(responseBodyStr string) {
+	// First, try to validate and pretty-print the JSON
+	var jsonCheck interface{}
+	if err := json.Unmarshal([]byte(responseBodyStr), &jsonCheck); err != nil {
+		ps.logger.WithError(err).WithFields(logrus.Fields{
+			"endpoint_type": "token",
+			"response_preview": responseBodyStr[:min(200, len(responseBodyStr))],
+			"response_full_length": len(responseBodyStr),
+		}).Debug("Invalid JSON in token response")
+		return
+	}
+
+	// Pretty print the JSON for better readability in debug logs
+	if prettyJSON, err := json.MarshalIndent(jsonCheck, "", "  "); err == nil {
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type": "token",
+			"pretty_json": string(prettyJSON),
+		}).Debug("Pretty-printed token response JSON")
+	}
+
+	// Now parse specifically for token analysis
 	var tokenData map[string]interface{}
-	if err := json.Unmarshal(responseBody, &tokenData); err != nil {
-		ps.logger.WithError(err).Debug("Failed to parse token response as JSON")
+	if err := json.Unmarshal([]byte(responseBodyStr), &tokenData); err != nil {
+		ps.logger.WithError(err).WithFields(logrus.Fields{
+			"endpoint_type": "token",
+			"response_preview": responseBodyStr[:min(200, len(responseBodyStr))],
+		}).Debug("Failed to parse token response as JSON object")
 		return
 	}
 
@@ -406,9 +477,11 @@ func (ps *ProxyServer) logRequestDetails(req *http.Request, endpointType string)
 // logProxyRequestDetails logs detailed request information at debug level for proxy requests
 func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType string) {
 	var bodyBytes []byte
+	var bodyStr string
 	if req.Body != nil {
 		bodyBytes, _ = io.ReadAll(req.Body)
-		req.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+		bodyStr = string(bodyBytes)
+		req.Body = io.NopCloser(strings.NewReader(bodyStr))
 	}
 
 	// Collect all headers
@@ -422,8 +495,8 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 	var parsedBody interface{}
 	contentType := req.Header.Get("Content-Type")
 	
-	if strings.Contains(contentType, "application/x-www-form-urlencoded") && len(bodyBytes) > 0 {
-		if values, err := url.ParseQuery(string(bodyBytes)); err == nil {
+	if strings.Contains(contentType, "application/x-www-form-urlencoded") && len(bodyStr) > 0 {
+		if values, err := url.ParseQuery(bodyStr); err == nil {
 			formData = values
 			
 			// Create a sanitized version for logging (hide sensitive data)
@@ -437,9 +510,9 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 			}
 			parsedBody = sanitizedForm
 		}
-	} else if strings.Contains(contentType, "application/json") && len(bodyBytes) > 0 {
+	} else if strings.Contains(contentType, "application/json") && len(bodyStr) > 0 {
 		var jsonData map[string]interface{}
-		if err := json.Unmarshal(bodyBytes, &jsonData); err == nil {
+		if err := json.Unmarshal([]byte(bodyStr), &jsonData); err == nil {
 			// Sanitize sensitive fields in JSON
 			sanitizedJson := make(map[string]interface{})
 			for key, value := range jsonData {
@@ -450,6 +523,12 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 				}
 			}
 			parsedBody = sanitizedJson
+		} else {
+			ps.logger.WithError(err).WithFields(logrus.Fields{
+				"endpoint_type": endpointType,
+				"content_type": contentType,
+				"body_preview": bodyStr[:min(200, len(bodyStr))],
+			}).Debug("Failed to parse request body as JSON")
 		}
 	}
 
@@ -469,8 +548,11 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 		"proto":            req.Proto,
 		"proto_major":      req.ProtoMajor,
 		"proto_minor":      req.ProtoMinor,
-		"body_raw":         string(bodyBytes),
-		"body_length":      len(bodyBytes),
+		"body_raw":         bodyStr,
+		"body_length":      len(bodyStr),
+		"body_bytes_length": len(bodyBytes),
+		"body_is_utf8":     isValidUTF8(bodyStr),
+		"charset":          extractCharsetFromContentType(contentType),
 		"parsed_body":      parsedBody,
 		"form_data_fields": len(formData),
 		"has_auth_header":  req.Header.Get("Authorization") != "",
