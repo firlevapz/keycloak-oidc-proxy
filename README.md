@@ -1,13 +1,13 @@
-# Keycloak OIDC Redirect Service
+# Keycloak OIDC Hybrid Service
 
-A lightweight Go-based redirect service that translates Keycloak-style OIDC endpoints to any OIDC provider by fetching configuration from a well-known OpenID Connect configuration endpoint and redirecting clients with preserved query parameters.
+A lightweight Go-based service that provides Keycloak-compatible OIDC endpoints with hybrid redirect/proxy behavior by fetching configuration from a well-known OpenID Connect configuration endpoint.
 
 ## Features
 
 - Fetches OIDC configuration from any `.well-known/openid-configuration` endpoint
-- Redirects Keycloak-style URLs to the actual OIDC provider endpoints (preserving all query parameters):
-  - `/protocol/openid-connect/auth` → `authorization_endpoint`
-  - `/protocol/openid-connect/token` → `token_endpoint`
+- **Hybrid approach** for Keycloak-style URLs:
+  - `/protocol/openid-connect/auth` → **Redirects** to `authorization_endpoint` (preserving all query parameters)
+  - `/protocol/openid-connect/token` → **Proxies** to `token_endpoint` (transparent backend handling)
 - Configurable logging levels (trace, debug, info, warn, error, fatal, panic)
 - Health check endpoint
 - Graceful shutdown
@@ -102,8 +102,8 @@ docker run -p 8080:8080 \
 
 ## Endpoints
 
-- `GET /protocol/openid-connect/auth` - Redirects to the authorization endpoint (HTTP 302)
-- `POST /protocol/openid-connect/token` - Redirects to the token endpoint (HTTP 302)
+- `GET /protocol/openid-connect/auth` - **Redirects** to the authorization endpoint (HTTP 302) with preserved query parameters
+- `POST /protocol/openid-connect/token` - **Proxies** to the token endpoint (transparent handling)
 - `GET /health` - Health check endpoint
 
 ## Example
@@ -116,30 +116,55 @@ If your OIDC provider configuration is:
 }
 ```
 
-Then:
-- `http://localhost:8080/protocol/openid-connect/auth?client_id=test&response_type=code` will redirect to `https://auth.hoad.at/application/o/authorize/?client_id=test&response_type=code`
-- `http://localhost:8080/protocol/openid-connect/token` will redirect to `https://auth.hoad.at/application/o/token/`
+### Authorization Endpoint (Redirect)
+- `http://localhost:8080/protocol/openid-connect/auth?client_id=test&response_type=code` will redirect (HTTP 302) to `https://auth.hoad.at/application/o/authorize/?client_id=test&response_type=code`
+- All query parameters are preserved during the redirect
 
-All query parameters are preserved during the redirect.
+### Token Endpoint (Proxy)
+- `POST http://localhost:8080/protocol/openid-connect/token` will proxy the request to `https://auth.hoad.at/application/o/token/`
+- Request body, headers, and response are transparently handled
+- Client receives the response as if calling the token endpoint directly
 
 ## Logging
 
 The application supports various log levels:
 
 - **trace**: Extremely verbose logging
-- **debug**: Detailed request/response information including headers, body, and redirect URLs
-- **info**: General operational information including redirect actions (default)
+- **debug**: Detailed request/response information including headers, body, redirect URLs, and proxy details
+- **info**: General operational information including redirect and proxy actions (default)
 - **warn**: Warning messages
 - **error**: Error messages
 - **fatal**: Fatal errors that cause the application to exit
 - **panic**: Panic level logging
 
-Set `LOG_LEVEL=debug` to see detailed request and redirect information.
+Set `LOG_LEVEL=debug` to see detailed request, redirect, and proxy information.
+
+## Why Hybrid Approach?
+
+This service uses a **hybrid approach** for optimal OIDC compatibility:
+
+### Authorization Endpoint - Redirect (HTTP 302)
+- **Use case**: Interactive user authentication in web browsers
+- **Why redirect**: Browsers need to navigate to the authorization server for user login
+- **Benefits**: 
+  - Preserves all query parameters (client_id, response_type, redirect_uri, etc.)
+  - Works with browser-based flows
+  - No server-side session handling needed
+
+### Token Endpoint - Proxy (Transparent)
+- **Use case**: Backend token exchange by applications
+- **Why proxy**: Applications expect direct API responses, not redirects
+- **Benefits**:
+  - Transparent to the calling application
+  - Preserves request/response body and headers
+  - Compatible with existing OAuth2/OIDC client libraries
+  - No application code changes needed
 
 ## Security Features
 
-- Request timeouts to prevent hanging connections during OIDC configuration fetching
+- Request timeouts to prevent hanging connections during OIDC configuration fetching and proxying
 - Graceful shutdown handling
+- Proper X-Forwarded headers for proxied requests
 - Minimal attack surface with scratch-based Docker image
 - No unnecessary dependencies in production image
 - URL validation for redirect endpoints

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -23,10 +24,11 @@ type OIDCConfiguration struct {
 	Issuer               string `json:"issuer"`
 }
 
-// ProxyServer holds the configuration and handlers for the OIDC redirect server
+// ProxyServer holds the configuration and handlers for the OIDC redirect/proxy server
 type ProxyServer struct {
-	config *OIDCConfiguration
-	logger *logrus.Logger
+	config     *OIDCConfiguration
+	logger     *logrus.Logger
+	tokenProxy *httputil.ReverseProxy
 }
 
 // NewProxyServer creates a new redirect server instance
@@ -45,6 +47,11 @@ func NewProxyServer(configURL string, logger *logrus.Logger) (*ProxyServer, erro
 	server := &ProxyServer{
 		config: config,
 		logger: logger,
+	}
+
+	// Create reverse proxy for token endpoint only
+	if err := server.createTokenProxy(); err != nil {
+		return nil, fmt.Errorf("failed to create token proxy: %w", err)
 	}
 
 	return server, nil
@@ -81,6 +88,51 @@ func fetchOIDCConfiguration(configURL string, logger *logrus.Logger) (*OIDCConfi
 	}
 
 	return &config, nil
+}
+
+// createTokenProxy sets up the reverse proxy for the token endpoint
+func (ps *ProxyServer) createTokenProxy() error {
+	tokenURL, err := url.Parse(ps.config.TokenEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to parse token endpoint: %w", err)
+	}
+	
+	ps.tokenProxy = httputil.NewSingleHostReverseProxy(tokenURL)
+	ps.tokenProxy.Director = ps.createTokenDirector(tokenURL)
+	
+	return nil
+}
+
+// createTokenDirector creates a custom director function for the token proxy
+func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) {
+	return func(req *http.Request) {
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type":  "token",
+			"original_path":  req.URL.Path,
+			"target_host":    target.Host,
+			"target_scheme":  target.Scheme,
+			"method":         req.Method,
+			"remote_addr":    req.RemoteAddr,
+			"user_agent":     req.UserAgent(),
+		}).Info("Proxying token request")
+
+		if ps.logger.Level >= logrus.DebugLevel {
+			ps.logProxyRequestDetails(req, "token")
+		}
+
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = target.Path
+		req.Host = target.Host
+
+		// Add X-Forwarded headers
+		if req.Header.Get("X-Forwarded-Proto") == "" {
+			req.Header.Set("X-Forwarded-Proto", "http")
+		}
+		if req.Header.Get("X-Forwarded-For") == "" {
+			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+		}
+	}
 }
 
 // buildRedirectURL constructs the redirect URL by preserving all query parameters
@@ -138,7 +190,7 @@ func (ps *ProxyServer) handleAuth(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirectURL, http.StatusFound)
 }
 
-// handleToken handles requests to /protocol/openid-connect/token by redirecting to token endpoint
+// handleToken handles requests to /protocol/openid-connect/token by proxying to token endpoint
 func (ps *ProxyServer) handleToken(w http.ResponseWriter, r *http.Request) {
 	ps.logger.WithFields(logrus.Fields{
 		"endpoint_type": "token",
@@ -147,28 +199,12 @@ func (ps *ProxyServer) handleToken(w http.ResponseWriter, r *http.Request) {
 		"remote_addr":   r.RemoteAddr,
 		"user_agent":    r.UserAgent(),
 		"query_params":  r.URL.RawQuery,
-	}).Info("Redirecting to token endpoint")
+	}).Info("Proxying to token endpoint")
 
-	if ps.logger.Level >= logrus.DebugLevel {
-		ps.logRequestDetails(r, "token")
-	}
-
-	redirectURL, err := ps.buildRedirectURL(ps.config.TokenEndpoint, r.URL.Query())
-	if err != nil {
-		ps.logger.WithError(err).Error("Failed to build redirect URL for token endpoint")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	ps.logger.WithFields(logrus.Fields{
-		"endpoint_type": "token",
-		"redirect_url":  redirectURL,
-	}).Info("Performing redirect")
-
-	http.Redirect(w, r, redirectURL, http.StatusFound)
+	ps.tokenProxy.ServeHTTP(w, r)
 }
 
-// logRequestDetails logs detailed request information at debug level
+// logRequestDetails logs detailed request information at debug level for redirects
 func (ps *ProxyServer) logRequestDetails(req *http.Request, endpointType string) {
 	var bodyBytes []byte
 	if req.Body != nil {
@@ -187,6 +223,27 @@ func (ps *ProxyServer) logRequestDetails(req *http.Request, endpointType string)
 		"body":          string(bodyBytes),
 		"query":         req.URL.RawQuery,
 	}).Debug("Request details")
+}
+
+// logProxyRequestDetails logs detailed request information at debug level for proxy requests
+func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType string) {
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+	}
+
+	headers := make(map[string]string)
+	for key, values := range req.Header {
+		headers[key] = strings.Join(values, ", ")
+	}
+
+	ps.logger.WithFields(logrus.Fields{
+		"endpoint_type": endpointType,
+		"headers":       headers,
+		"body":          string(bodyBytes),
+		"query":         req.URL.RawQuery,
+	}).Debug("Proxy request details")
 }
 
 // handleHealth provides a health check endpoint
@@ -259,10 +316,10 @@ func main() {
 		port = "8080"
 	}
 
-	// Create proxy server
+	// Create redirect/proxy server
 	proxyServer, err := NewProxyServer(configURL, logger)
 	if err != nil {
-		logger.WithError(err).Fatal("Failed to create proxy server")
+		logger.WithError(err).Fatal("Failed to create redirect/proxy server")
 	}
 
 	// Setup HTTP server
@@ -281,7 +338,7 @@ func main() {
 
 	// Start server in a goroutine
 	go func() {
-		logger.WithField("port", port).Info("Starting OIDC proxy server")
+		logger.WithField("port", port).Info("Starting OIDC redirect/proxy server")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.WithError(err).Fatal("Server failed to start")
 		}
