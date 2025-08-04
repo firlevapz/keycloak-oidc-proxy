@@ -192,6 +192,10 @@ func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) 
 		req.URL.Path = target.Path
 		req.Host = target.Host
 
+		// Disable gzip compression to ensure plaintext responses
+		req.Header.Set("Accept-Encoding", "identity")
+		// Alternative: req.Header.Del("Accept-Encoding") - completely remove the header
+		
 		// Add X-Forwarded headers
 		if req.Header.Get("X-Forwarded-Proto") == "" {
 			req.Header.Set("X-Forwarded-Proto", originalScheme)
@@ -207,6 +211,7 @@ func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) 
 			"endpoint_type": "token",
 			"final_url":     req.URL.String(),
 			"final_host":    req.Host,
+			"accept_encoding": req.Header.Get("Accept-Encoding"),
 		}).Debug("Token request URL transformation complete")
 	}
 }
