@@ -8,6 +8,7 @@ A lightweight Go-based service that provides Keycloak-compatible OIDC endpoints 
 - **Hybrid approach** for Keycloak-style URLs:
   - `/protocol/openid-connect/auth` → **Redirects** to `authorization_endpoint` (preserving all query parameters)
   - `/protocol/openid-connect/token` → **Proxies** to `token_endpoint` (transparent backend handling)
+  - `/protocol/openid-connect/userinfo` → **Proxies** to `userinfo_endpoint` (transparent backend handling)
 - Configurable logging levels (trace, debug, info, warn, error, fatal, panic)
 - Health check endpoint
 - Graceful shutdown
@@ -100,10 +101,24 @@ docker run -p 8080:8080 \
   keycloak-oidc-proxy
 ```
 
+## Debug Logging
+
+The service provides comprehensive debug logging when `LOG_LEVEL=debug` is set. This includes:
+
+- **Request Details**: Method, URL, headers, body content
+- **Response Analysis**: Status codes, headers, content type, encoding
+- **JSON Parsing**: Pretty-printed JSON responses for token and userinfo endpoints
+- **Content Encoding**: Automatic detection and reporting of compression
+- **UTF-8 Validation**: Character encoding validation for response bodies
+- **Proxy Behavior**: Detailed logs of request transformation and forwarding
+
+**Note**: To ensure proper JSON response logging, the service automatically sets `Accept-Encoding: identity` header for token and userinfo endpoint requests, which disables gzip compression and allows for plaintext response analysis.
+
 ## Endpoints
 
 - `GET /protocol/openid-connect/auth` - **Redirects** to the authorization endpoint (HTTP 302) with preserved query parameters
 - `POST /protocol/openid-connect/token` - **Proxies** to the token endpoint (transparent handling)
+- `GET /protocol/openid-connect/userinfo` - **Proxies** to the userinfo endpoint (transparent handling)
 - `GET /health` - Health check endpoint
 
 ## Example

@@ -37,19 +37,19 @@ func extractCharsetFromContentType(contentType string) string {
 	if contentType == "" {
 		return "unknown"
 	}
-	
+
 	// Look for charset parameter in Content-Type header
 	re := regexp.MustCompile(`charset=([^;]+)`)
 	matches := re.FindStringSubmatch(contentType)
 	if len(matches) > 1 {
 		return strings.TrimSpace(matches[1])
 	}
-	
+
 	// Default charset for JSON is UTF-8
 	if strings.Contains(contentType, "application/json") {
 		return "utf-8"
 	}
-	
+
 	return "unknown"
 }
 
@@ -74,14 +74,16 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 type OIDCConfiguration struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
-	Issuer               string `json:"issuer"`
+	UserinfoEndpoint      string `json:"userinfo_endpoint"`
+	Issuer                string `json:"issuer"`
 }
 
 // ProxyServer holds the configuration and handlers for the OIDC redirect/proxy server
 type ProxyServer struct {
-	config     *OIDCConfiguration
-	logger     *logrus.Logger
-	tokenProxy *httputil.ReverseProxy
+	config        *OIDCConfiguration
+	logger        *logrus.Logger
+	tokenProxy    *httputil.ReverseProxy
+	userinfoProxy *httputil.ReverseProxy
 }
 
 // NewProxyServer creates a new redirect server instance
@@ -93,8 +95,9 @@ func NewProxyServer(configURL string, logger *logrus.Logger) (*ProxyServer, erro
 
 	logger.WithFields(logrus.Fields{
 		"authorization_endpoint": config.AuthorizationEndpoint,
-		"token_endpoint":        config.TokenEndpoint,
-		"issuer":               config.Issuer,
+		"token_endpoint":         config.TokenEndpoint,
+		"userinfo_endpoint":      config.UserinfoEndpoint,
+		"issuer":                 config.Issuer,
 	}).Info("OIDC configuration loaded successfully")
 
 	server := &ProxyServer{
@@ -105,6 +108,11 @@ func NewProxyServer(configURL string, logger *logrus.Logger) (*ProxyServer, erro
 	// Create reverse proxy for token endpoint only
 	if err := server.createTokenProxy(); err != nil {
 		return nil, fmt.Errorf("failed to create token proxy: %w", err)
+	}
+
+	// Create reverse proxy for userinfo endpoint
+	if err := server.createUserinfoProxy(); err != nil {
+		return nil, fmt.Errorf("failed to create userinfo proxy: %w", err)
 	}
 
 	return server, nil
@@ -149,15 +157,15 @@ func (ps *ProxyServer) createTokenProxy() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse token endpoint: %w", err)
 	}
-	
+
 	ps.tokenProxy = httputil.NewSingleHostReverseProxy(tokenURL)
 	ps.tokenProxy.Director = ps.createTokenDirector(tokenURL)
-	
+
 	// Add response modifier for detailed logging
 	if ps.logger.Level >= logrus.DebugLevel {
 		ps.tokenProxy.ModifyResponse = ps.modifyTokenResponse
 	}
-	
+
 	return nil
 }
 
@@ -167,19 +175,19 @@ func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) 
 		originalScheme := req.URL.Scheme
 		originalHost := req.URL.Host
 		originalPath := req.URL.Path
-		
+
 		ps.logger.WithFields(logrus.Fields{
-			"endpoint_type":  "token",
-			"original_path":  originalPath,
-			"original_host":  originalHost,
-			"original_scheme": originalScheme,
-			"target_host":    target.Host,
-			"target_scheme":  target.Scheme,
-			"target_path":    target.Path,
-			"method":         req.Method,
-			"remote_addr":    req.RemoteAddr,
-			"user_agent":     req.UserAgent(),
-			"content_length": req.ContentLength,
+			"endpoint_type":     "token",
+			"original_path":     originalPath,
+			"original_host":     originalHost,
+			"original_scheme":   originalScheme,
+			"target_host":       target.Host,
+			"target_scheme":     target.Scheme,
+			"target_path":       target.Path,
+			"method":            req.Method,
+			"remote_addr":       req.RemoteAddr,
+			"user_agent":        req.UserAgent(),
+			"content_length":    req.ContentLength,
 			"transfer_encoding": req.TransferEncoding,
 		}).Info("Proxying token request")
 
@@ -195,7 +203,7 @@ func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) 
 		// Disable gzip compression to ensure plaintext responses
 		req.Header.Set("Accept-Encoding", "identity")
 		// Alternative: req.Header.Del("Accept-Encoding") - completely remove the header
-		
+
 		// Add X-Forwarded headers
 		if req.Header.Get("X-Forwarded-Proto") == "" {
 			req.Header.Set("X-Forwarded-Proto", originalScheme)
@@ -208,11 +216,88 @@ func (ps *ProxyServer) createTokenDirector(target *url.URL) func(*http.Request) 
 		}
 
 		ps.logger.WithFields(logrus.Fields{
-			"endpoint_type": "token",
-			"final_url":     req.URL.String(),
-			"final_host":    req.Host,
+			"endpoint_type":   "token",
+			"final_url":       req.URL.String(),
+			"final_host":      req.Host,
 			"accept_encoding": req.Header.Get("Accept-Encoding"),
 		}).Debug("Token request URL transformation complete")
+	}
+}
+
+// createUserinfoProxy sets up the reverse proxy for the userinfo endpoint
+func (ps *ProxyServer) createUserinfoProxy() error {
+	if ps.config.UserinfoEndpoint == "" {
+		ps.logger.Warn("No userinfo endpoint configured, userinfo proxy will not be available")
+		return nil
+	}
+
+	userinfoURL, err := url.Parse(ps.config.UserinfoEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to parse userinfo endpoint: %w", err)
+	}
+
+	ps.userinfoProxy = httputil.NewSingleHostReverseProxy(userinfoURL)
+	ps.userinfoProxy.Director = ps.createUserinfoDirector(userinfoURL)
+
+	// Add response modifier for detailed logging
+	if ps.logger.Level >= logrus.DebugLevel {
+		ps.userinfoProxy.ModifyResponse = ps.modifyUserinfoResponse
+	}
+
+	return nil
+}
+
+// createUserinfoDirector creates a custom director function for the userinfo proxy
+func (ps *ProxyServer) createUserinfoDirector(target *url.URL) func(*http.Request) {
+	return func(req *http.Request) {
+		originalScheme := req.URL.Scheme
+		originalHost := req.URL.Host
+		originalPath := req.URL.Path
+
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type":     "userinfo",
+			"original_path":     originalPath,
+			"original_host":     originalHost,
+			"original_scheme":   originalScheme,
+			"target_host":       target.Host,
+			"target_scheme":     target.Scheme,
+			"target_path":       target.Path,
+			"method":            req.Method,
+			"remote_addr":       req.RemoteAddr,
+			"user_agent":        req.UserAgent(),
+			"content_length":    req.ContentLength,
+			"transfer_encoding": req.TransferEncoding,
+		}).Info("Proxying userinfo request")
+
+		if ps.logger.Level >= logrus.DebugLevel {
+			ps.logProxyRequestDetails(req, "userinfo")
+		}
+
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = target.Path
+		req.Host = target.Host
+
+		// Disable gzip compression to ensure plaintext responses
+		req.Header.Set("Accept-Encoding", "identity")
+
+		// Add X-Forwarded headers
+		if req.Header.Get("X-Forwarded-Proto") == "" {
+			req.Header.Set("X-Forwarded-Proto", originalScheme)
+		}
+		if req.Header.Get("X-Forwarded-For") == "" {
+			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+		}
+		if req.Header.Get("X-Forwarded-Host") == "" {
+			req.Header.Set("X-Forwarded-Host", originalHost)
+		}
+
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type":   "userinfo",
+			"final_url":       req.URL.String(),
+			"final_host":      req.Host,
+			"accept_encoding": req.Header.Get("Accept-Encoding"),
+		}).Debug("Userinfo request URL transformation complete")
 	}
 }
 
@@ -236,12 +321,12 @@ func (ps *ProxyServer) modifyTokenResponse(resp *http.Response) error {
 			responseBodyStr = string(responseBody)
 			// Restore the response body with a new reader
 			resp.Body = io.NopCloser(strings.NewReader(responseBodyStr))
-			
+
 			ps.logger.WithFields(logrus.Fields{
-				"endpoint_type": "token",
-				"body_bytes_length": len(responseBody),
+				"endpoint_type":      "token",
+				"body_bytes_length":  len(responseBody),
 				"body_string_length": len(responseBodyStr),
-				"body_is_utf8": isValidUTF8(responseBodyStr),
+				"body_is_utf8":       isValidUTF8(responseBodyStr),
 			}).Debug("Response body reading completed")
 		}
 	}
@@ -253,18 +338,18 @@ func (ps *ProxyServer) modifyTokenResponse(resp *http.Response) error {
 	}
 
 	ps.logger.WithFields(logrus.Fields{
-		"endpoint_type":      "token",
-		"response_status":    resp.Status,
-		"response_status_code": resp.StatusCode,
-		"response_headers":   responseHeaders,
-		"response_body":      responseBodyStr,
-		"response_length":    len(responseBodyStr),
+		"endpoint_type":         "token",
+		"response_status":       resp.Status,
+		"response_status_code":  resp.StatusCode,
+		"response_headers":      responseHeaders,
+		"response_body":         responseBodyStr,
+		"response_length":       len(responseBodyStr),
 		"response_bytes_length": len(responseBody),
-		"content_type":       resp.Header.Get("Content-Type"),
-		"cache_control":      resp.Header.Get("Cache-Control"),
-		"expires":           resp.Header.Get("Expires"),
-		"content_encoding":   resp.Header.Get("Content-Encoding"),
-		"charset":           extractCharsetFromContentType(resp.Header.Get("Content-Type")),
+		"content_type":          resp.Header.Get("Content-Type"),
+		"cache_control":         resp.Header.Get("Cache-Control"),
+		"expires":               resp.Header.Get("Expires"),
+		"content_encoding":      resp.Header.Get("Content-Encoding"),
+		"charset":               extractCharsetFromContentType(resp.Header.Get("Content-Type")),
 	}).Debug("Token endpoint response details")
 
 	// Log specific token response analysis for JSON content
@@ -273,9 +358,9 @@ func (ps *ProxyServer) modifyTokenResponse(resp *http.Response) error {
 	} else if len(responseBodyStr) > 0 {
 		// Log non-JSON responses with a preview
 		ps.logger.WithFields(logrus.Fields{
-			"endpoint_type": "token",
+			"endpoint_type":    "token",
 			"response_preview": responseBodyStr[:min(500, len(responseBodyStr))],
-			"is_json": false,
+			"is_json":          false,
 		}).Debug("Non-JSON token response preview")
 	}
 
@@ -288,8 +373,8 @@ func (ps *ProxyServer) analyzeTokenResponse(responseBodyStr string) {
 	var jsonCheck interface{}
 	if err := json.Unmarshal([]byte(responseBodyStr), &jsonCheck); err != nil {
 		ps.logger.WithError(err).WithFields(logrus.Fields{
-			"endpoint_type": "token",
-			"response_preview": responseBodyStr[:min(200, len(responseBodyStr))],
+			"endpoint_type":        "token",
+			"response_preview":     responseBodyStr[:min(200, len(responseBodyStr))],
 			"response_full_length": len(responseBodyStr),
 		}).Debug("Invalid JSON in token response")
 		return
@@ -299,7 +384,7 @@ func (ps *ProxyServer) analyzeTokenResponse(responseBodyStr string) {
 	if prettyJSON, err := json.MarshalIndent(jsonCheck, "", "  "); err == nil {
 		ps.logger.WithFields(logrus.Fields{
 			"endpoint_type": "token",
-			"pretty_json": string(prettyJSON),
+			"pretty_json":   string(prettyJSON),
 		}).Debug("Pretty-printed token response JSON")
 	}
 
@@ -307,7 +392,7 @@ func (ps *ProxyServer) analyzeTokenResponse(responseBodyStr string) {
 	var tokenData map[string]interface{}
 	if err := json.Unmarshal([]byte(responseBodyStr), &tokenData); err != nil {
 		ps.logger.WithError(err).WithFields(logrus.Fields{
-			"endpoint_type": "token",
+			"endpoint_type":    "token",
 			"response_preview": responseBodyStr[:min(200, len(responseBodyStr))],
 		}).Debug("Failed to parse token response as JSON object")
 		return
@@ -360,6 +445,162 @@ func (ps *ProxyServer) analyzeTokenResponse(responseBodyStr string) {
 	ps.logger.WithFields(analysis).Debug("Token response analysis")
 }
 
+// modifyUserinfoResponse logs detailed response information for userinfo endpoint
+func (ps *ProxyServer) modifyUserinfoResponse(resp *http.Response) error {
+	if resp == nil {
+		ps.logger.Error("Received nil response from userinfo endpoint")
+		return nil
+	}
+
+	// Read the response body for logging
+	var responseBody []byte
+	var responseBodyStr string
+	if resp.Body != nil {
+		var err error
+		responseBody, err = io.ReadAll(resp.Body)
+		if err != nil {
+			ps.logger.WithError(err).Error("Failed to read userinfo response body for logging")
+		} else {
+			// Convert to string handling UTF-8 encoding properly
+			responseBodyStr = string(responseBody)
+			// Restore the response body with a new reader
+			resp.Body = io.NopCloser(strings.NewReader(responseBodyStr))
+
+			ps.logger.WithFields(logrus.Fields{
+				"endpoint_type":      "userinfo",
+				"body_bytes_length":  len(responseBody),
+				"body_string_length": len(responseBodyStr),
+				"body_is_utf8":       isValidUTF8(responseBodyStr),
+			}).Debug("Response body reading completed")
+		}
+	}
+
+	// Collect response headers
+	responseHeaders := make(map[string]string)
+	for key, values := range resp.Header {
+		responseHeaders[key] = strings.Join(values, ", ")
+	}
+
+	ps.logger.WithFields(logrus.Fields{
+		"endpoint_type":         "userinfo",
+		"response_status":       resp.Status,
+		"response_status_code":  resp.StatusCode,
+		"response_headers":      responseHeaders,
+		"response_body":         responseBodyStr,
+		"response_length":       len(responseBodyStr),
+		"response_bytes_length": len(responseBody),
+		"content_type":          resp.Header.Get("Content-Type"),
+		"cache_control":         resp.Header.Get("Cache-Control"),
+		"expires":               resp.Header.Get("Expires"),
+		"content_encoding":      resp.Header.Get("Content-Encoding"),
+		"charset":               extractCharsetFromContentType(resp.Header.Get("Content-Type")),
+	}).Debug("Userinfo endpoint response details")
+
+	// Log specific userinfo response analysis for JSON content
+	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") && len(responseBodyStr) > 0 {
+		ps.analyzeUserinfoResponse(responseBodyStr)
+	} else if len(responseBodyStr) > 0 {
+		// Log non-JSON responses with a preview
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type":    "userinfo",
+			"response_preview": responseBodyStr[:min(500, len(responseBodyStr))],
+			"is_json":          false,
+		}).Debug("Non-JSON userinfo response preview")
+	}
+
+	return nil
+}
+
+// analyzeUserinfoResponse analyzes and logs userinfo response content
+func (ps *ProxyServer) analyzeUserinfoResponse(responseBodyStr string) {
+	// First, try to validate and pretty-print the JSON
+	var jsonCheck interface{}
+	if err := json.Unmarshal([]byte(responseBodyStr), &jsonCheck); err != nil {
+		ps.logger.WithError(err).WithFields(logrus.Fields{
+			"endpoint_type":        "userinfo",
+			"response_preview":     responseBodyStr[:min(200, len(responseBodyStr))],
+			"response_full_length": len(responseBodyStr),
+		}).Debug("Invalid JSON in userinfo response")
+		return
+	}
+
+	// Pretty print the JSON for better readability in debug logs
+	if prettyJSON, err := json.MarshalIndent(jsonCheck, "", "  "); err == nil {
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type": "userinfo",
+			"pretty_json":   string(prettyJSON),
+		}).Debug("Pretty-printed userinfo response JSON")
+	}
+
+	// Now parse specifically for userinfo analysis
+	var userinfoData map[string]interface{}
+	if err := json.Unmarshal([]byte(responseBodyStr), &userinfoData); err != nil {
+		ps.logger.WithError(err).WithFields(logrus.Fields{
+			"endpoint_type":    "userinfo",
+			"response_preview": responseBodyStr[:min(200, len(responseBodyStr))],
+		}).Debug("Failed to parse userinfo response as JSON object")
+		return
+	}
+
+	// Log userinfo response analysis
+	analysis := logrus.Fields{
+		"endpoint_type": "userinfo",
+	}
+
+	// Check for standard OIDC userinfo fields
+	if sub, ok := userinfoData["sub"].(string); ok {
+		analysis["subject"] = sub
+	}
+
+	if name, ok := userinfoData["name"].(string); ok {
+		analysis["has_name"] = true
+		analysis["name"] = name
+	}
+
+	if email, ok := userinfoData["email"].(string); ok {
+		analysis["has_email"] = true
+		analysis["email"] = email
+	}
+
+	if emailVerified, ok := userinfoData["email_verified"].(bool); ok {
+		analysis["email_verified"] = emailVerified
+	}
+
+	if givenName, ok := userinfoData["given_name"].(string); ok {
+		analysis["has_given_name"] = true
+		analysis["given_name"] = givenName
+	}
+
+	if familyName, ok := userinfoData["family_name"].(string); ok {
+		analysis["has_family_name"] = true
+		analysis["family_name"] = familyName
+	}
+
+	if preferredUsername, ok := userinfoData["preferred_username"].(string); ok {
+		analysis["has_preferred_username"] = true
+		analysis["preferred_username"] = preferredUsername
+	}
+
+	if picture, ok := userinfoData["picture"].(string); ok {
+		analysis["has_picture"] = true
+		analysis["picture_url"] = picture
+	}
+
+	// Check for error fields
+	if errorCode, ok := userinfoData["error"].(string); ok {
+		analysis["error_code"] = errorCode
+	}
+
+	if errorDesc, ok := userinfoData["error_description"].(string); ok {
+		analysis["error_description"] = errorDesc
+	}
+
+	// Count total fields
+	analysis["total_fields"] = len(userinfoData)
+
+	ps.logger.WithFields(analysis).Debug("Userinfo response analysis")
+}
+
 // buildRedirectURL constructs the redirect URL by preserving all query parameters
 func (ps *ProxyServer) buildRedirectURL(targetEndpoint string, originalQuery url.Values) (string, error) {
 	targetURL, err := url.Parse(targetEndpoint)
@@ -371,14 +612,14 @@ func (ps *ProxyServer) buildRedirectURL(targetEndpoint string, originalQuery url
 	if len(originalQuery) > 0 {
 		// Parse existing query parameters from target URL
 		existingQuery := targetURL.Query()
-		
+
 		// Add original query parameters (original takes precedence if there are conflicts)
 		for key, values := range originalQuery {
 			for _, value := range values {
 				existingQuery.Add(key, value)
 			}
 		}
-		
+
 		targetURL.RawQuery = existingQuery.Encode()
 	}
 
@@ -418,7 +659,7 @@ func (ps *ProxyServer) handleAuth(w http.ResponseWriter, r *http.Request) {
 // handleToken handles requests to /protocol/openid-connect/token by proxying to token endpoint
 func (ps *ProxyServer) handleToken(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	
+
 	ps.logger.WithFields(logrus.Fields{
 		"endpoint_type": "token",
 		"original_path": r.URL.Path,
@@ -434,19 +675,19 @@ func (ps *ProxyServer) handleToken(w http.ResponseWriter, r *http.Request) {
 		wrappedWriter := &responseWriter{
 			ResponseWriter: w,
 			statusCode:     200, // default
-			body:          &strings.Builder{},
+			body:           &strings.Builder{},
 		}
-		
+
 		ps.tokenProxy.ServeHTTP(wrappedWriter, r)
-		
+
 		duration := time.Since(startTime)
 		ps.logger.WithFields(logrus.Fields{
-			"endpoint_type":     "token",
-			"duration_ms":       duration.Milliseconds(),
-			"duration_ns":       duration.Nanoseconds(),
-			"response_status":   wrappedWriter.statusCode,
-			"response_size":     wrappedWriter.body.Len(),
-			"end_time":          time.Now().Format(time.RFC3339Nano),
+			"endpoint_type":   "token",
+			"duration_ms":     duration.Milliseconds(),
+			"duration_ns":     duration.Nanoseconds(),
+			"response_status": wrappedWriter.statusCode,
+			"response_size":   wrappedWriter.body.Len(),
+			"end_time":        time.Now().Format(time.RFC3339Nano),
 		}).Debug("Token proxy request completed")
 	} else {
 		ps.tokenProxy.ServeHTTP(w, r)
@@ -455,6 +696,56 @@ func (ps *ProxyServer) handleToken(w http.ResponseWriter, r *http.Request) {
 			"endpoint_type": "token",
 			"duration_ms":   duration.Milliseconds(),
 		}).Info("Token proxy request completed")
+	}
+}
+
+// handleUserinfo handles requests to /protocol/openid-connect/userinfo by proxying to userinfo endpoint
+func (ps *ProxyServer) handleUserinfo(w http.ResponseWriter, r *http.Request) {
+	if ps.userinfoProxy == nil {
+		ps.logger.Error("Userinfo proxy not configured")
+		http.Error(w, "Userinfo endpoint not available", http.StatusNotImplemented)
+		return
+	}
+
+	startTime := time.Now()
+
+	ps.logger.WithFields(logrus.Fields{
+		"endpoint_type":   "userinfo",
+		"original_path":   r.URL.Path,
+		"method":          r.Method,
+		"remote_addr":     r.RemoteAddr,
+		"user_agent":      r.UserAgent(),
+		"query_params":    r.URL.RawQuery,
+		"start_time":      startTime.Format(time.RFC3339Nano),
+		"has_auth_header": r.Header.Get("Authorization") != "",
+	}).Info("Proxying to userinfo endpoint")
+
+	// Create a response writer wrapper to capture response details
+	if ps.logger.Level >= logrus.DebugLevel {
+		wrappedWriter := &responseWriter{
+			ResponseWriter: w,
+			statusCode:     200, // default
+			body:           &strings.Builder{},
+		}
+
+		ps.userinfoProxy.ServeHTTP(wrappedWriter, r)
+
+		duration := time.Since(startTime)
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type":   "userinfo",
+			"duration_ms":     duration.Milliseconds(),
+			"duration_ns":     duration.Nanoseconds(),
+			"response_status": wrappedWriter.statusCode,
+			"response_size":   wrappedWriter.body.Len(),
+			"end_time":        time.Now().Format(time.RFC3339Nano),
+		}).Debug("Userinfo proxy request completed")
+	} else {
+		ps.userinfoProxy.ServeHTTP(w, r)
+		duration := time.Since(startTime)
+		ps.logger.WithFields(logrus.Fields{
+			"endpoint_type": "userinfo",
+			"duration_ms":   duration.Milliseconds(),
+		}).Info("Userinfo proxy request completed")
 	}
 }
 
@@ -499,11 +790,11 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 	var formData map[string][]string
 	var parsedBody interface{}
 	contentType := req.Header.Get("Content-Type")
-	
+
 	if strings.Contains(contentType, "application/x-www-form-urlencoded") && len(bodyStr) > 0 {
 		if values, err := url.ParseQuery(bodyStr); err == nil {
 			formData = values
-			
+
 			// Create a sanitized version for logging (hide sensitive data)
 			sanitizedForm := make(map[string]string)
 			for key, vals := range values {
@@ -531,8 +822,8 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 		} else {
 			ps.logger.WithError(err).WithFields(logrus.Fields{
 				"endpoint_type": endpointType,
-				"content_type": contentType,
-				"body_preview": bodyStr[:min(200, len(bodyStr))],
+				"content_type":  contentType,
+				"body_preview":  bodyStr[:min(200, len(bodyStr))],
 			}).Debug("Failed to parse request body as JSON")
 		}
 	}
@@ -540,30 +831,30 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 	// Log comprehensive request details
 	ps.logger.WithFields(logrus.Fields{
 		"endpoint_type":     endpointType,
-		"method":           req.Method,
-		"url":              req.URL.String(),
-		"raw_query":        req.URL.RawQuery,
-		"headers":          headers,
-		"content_type":     contentType,
-		"content_length":   req.ContentLength,
+		"method":            req.Method,
+		"url":               req.URL.String(),
+		"raw_query":         req.URL.RawQuery,
+		"headers":           headers,
+		"content_type":      contentType,
+		"content_length":    req.ContentLength,
 		"transfer_encoding": req.TransferEncoding,
-		"host":             req.Host,
-		"remote_addr":      req.RemoteAddr,
-		"request_uri":      req.RequestURI,
-		"proto":            req.Proto,
-		"proto_major":      req.ProtoMajor,
-		"proto_minor":      req.ProtoMinor,
-		"body_raw":         bodyStr,
-		"body_length":      len(bodyStr),
+		"host":              req.Host,
+		"remote_addr":       req.RemoteAddr,
+		"request_uri":       req.RequestURI,
+		"proto":             req.Proto,
+		"proto_major":       req.ProtoMajor,
+		"proto_minor":       req.ProtoMinor,
+		"body_raw":          bodyStr,
+		"body_length":       len(bodyStr),
 		"body_bytes_length": len(bodyBytes),
-		"body_is_utf8":     isValidUTF8(bodyStr),
-		"charset":          extractCharsetFromContentType(contentType),
-		"parsed_body":      parsedBody,
-		"form_data_fields": len(formData),
-		"has_auth_header":  req.Header.Get("Authorization") != "",
-		"user_agent":       req.UserAgent(),
-		"referer":          req.Header.Get("Referer"),
-		"origin":           req.Header.Get("Origin"),
+		"body_is_utf8":      isValidUTF8(bodyStr),
+		"charset":           extractCharsetFromContentType(contentType),
+		"parsed_body":       parsedBody,
+		"form_data_fields":  len(formData),
+		"has_auth_header":   req.Header.Get("Authorization") != "",
+		"user_agent":        req.UserAgent(),
+		"referer":           req.Header.Get("Referer"),
+		"origin":            req.Header.Get("Origin"),
 	}).Debug("Detailed proxy request information")
 
 	// Log query parameters separately if they exist
@@ -577,7 +868,7 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 			}
 		}
 		ps.logger.WithFields(logrus.Fields{
-			"endpoint_type":   endpointType,
+			"endpoint_type":    endpointType,
 			"query_parameters": queryParams,
 		}).Debug("Query parameters details")
 	}
@@ -594,7 +885,7 @@ func (ps *ProxyServer) logProxyRequestDetails(req *http.Request, endpointType st
 		}
 		ps.logger.WithFields(logrus.Fields{
 			"endpoint_type": endpointType,
-			"cookies":      cookieDetails,
+			"cookies":       cookieDetails,
 		}).Debug("Request cookies")
 	}
 }
@@ -606,7 +897,7 @@ func (ps *ProxyServer) isSensitiveField(fieldName string) bool {
 		"id_token", "authorization", "auth", "secret", "key", "token",
 		"credential", "pass", "pwd",
 	}
-	
+
 	fieldLower := strings.ToLower(fieldName)
 	for _, sensitive := range sensitiveFields {
 		if strings.Contains(fieldLower, sensitive) {
@@ -629,18 +920,19 @@ func (ps *ProxyServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 // setupRoutes configures the HTTP routes
 func (ps *ProxyServer) setupRoutes() *http.ServeMux {
 	mux := http.NewServeMux()
-	
+
 	mux.HandleFunc("/protocol/openid-connect/auth", ps.handleAuth)
 	mux.HandleFunc("/protocol/openid-connect/token", ps.handleToken)
+	mux.HandleFunc("/protocol/openid-connect/userinfo", ps.handleUserinfo)
 	mux.HandleFunc("/health", ps.handleHealth)
-	
+
 	return mux
 }
 
 // setupLogger configures the logger based on environment variables
 func setupLogger() *logrus.Logger {
 	logger := logrus.New()
-	
+
 	// Set log level from environment variable
 	logLevel := strings.ToLower(os.Getenv("LOG_LEVEL"))
 	switch logLevel {
@@ -695,8 +987,8 @@ func main() {
 	// Setup HTTP server
 	mux := proxyServer.setupRoutes()
 	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
+		Addr:         ":" + port,
+		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
